@@ -53,13 +53,14 @@ def build_xml_inner_grammar(tools: List[dict]) -> str:
         func_rules.append(f"{param_rule_name}: {param_alts}")
 
     func_branch = " | ".join(func_alts)
+    func_rules_str = "\n".join(func_rules)
 
     grammar = f"""
 ?start: /\\n/? function /\\n/?
 
 function: {func_branch}
 
-{"\n".join(func_rules)}
+{func_rules_str}
 
 PARAM_VALUE: /[^<]+/
 """
@@ -124,12 +125,11 @@ class QwenXmlToolGrammarProcessor:
         if self._terminated or not self._in_tool_call or self._matcher is None:
             return logits
 
-        # Normalize shapes: per-row call may be 1D or batched single row
+        # Preserve the original shape so we can return logits with the same
+        # number of dimensions the caller passed in.
+        original_shape = logits.shape
         if logits.ndim == 1:
             logits = logits[None, :]
-            single_row = True
-        else:
-            single_row = logits.shape[0] == 1
 
         self._bitmask.fill(-1)
         try:
@@ -143,7 +143,9 @@ class QwenXmlToolGrammarProcessor:
 
             masked = llguidance.mlx.apply_token_bitmask(logits, self._bitmask[0])
             masked = mx.array(masked)
-            if single_row and masked.ndim > 1:
+            # If the caller passed a 1D logits vector, apply_token_bitmask
+            # expanded it to 2D; squeeze back to match the original shape.
+            if len(original_shape) == 1 and masked.ndim > 1:
                 masked = masked[0]
             return masked
         except Exception as e:
