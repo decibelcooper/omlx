@@ -2702,6 +2702,7 @@ class VLMBatchedEngine(BaseEngine):
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
+            tools=kwargs.get("tools", None),
             seed=kwargs.get("seed", None),
         )
 
@@ -2805,6 +2806,7 @@ class VLMBatchedEngine(BaseEngine):
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
+            tools=kwargs.get("tools", None),
             seed=kwargs.get("seed", None),
         )
 

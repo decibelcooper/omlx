@@ -660,20 +660,18 @@ def _patched_generation_batch_step(self):
     # self._next_tokens contains the just-sampled tokens (async eval pending).
     # We need to accept them NOW so the next __call__ fills the correct bitmask.
     if any(self.logits_processors):
-        from .api.grammar import GrammarConstraintProcessor
-
-        has_grammar = any(
-            isinstance(p, GrammarConstraintProcessor)
+        has_token_accept = any(
+            hasattr(p, "accept_token")
             for procs in self.logits_processors
             for p in procs
         )
-        if has_grammar:
+        if has_token_accept:
             # Force eval of the sampled tokens so we can read them.
             mx.eval(self._next_tokens)
             sampled = self._next_tokens.tolist()
             for e in range(len(self.uids)):
                 for proc in self.logits_processors[e]:
-                    if isinstance(proc, GrammarConstraintProcessor):
+                    if hasattr(proc, "accept_token"):
                         proc.accept_token(sampled[e])
 
     return result
@@ -4482,6 +4480,26 @@ class Scheduler:
                     )
             except ImportError:
                 logger.warning("xgrammar not installed; skipping grammar constraint")
+
+        # Add Qwen3-style XML tool-call grammar processor.  This constrains
+        # generation only inside <tool_call>...</tool_call> markers, mirroring
+        # the approach used by qwen-perfect.
+        if sampling_params.tools:
+            try:
+                from .api.qwen_tool_grammar import build_qwen_tool_grammar_processor
+
+                vocab_size = self._get_model_vocab_size()
+                processor = build_qwen_tool_grammar_processor(
+                    self.tokenizer,
+                    sampling_params.tools,
+                    vocab_size=vocab_size,
+                )
+                if processor is not None:
+                    logits_processors.append(processor)
+            except Exception as e:
+                logger.warning(
+                    "Failed to build Qwen XML tool grammar processor: %s", e
+                )
 
         return sampler, logits_processors
 

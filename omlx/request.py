@@ -77,6 +77,10 @@ class SamplingParams:
     # Typed as Any to avoid a hard dependency on xgrammar at import time.
     compiled_grammar: Any = None
 
+    # OpenAI-style tool definitions.  When set, the scheduler may attach a
+    # request-specific logits processor that constrains tool-call markup.
+    tools: Optional[List[dict]] = None
+
     # Seed for reproducible generation (best-effort, per OpenAI spec)
     seed: Optional[int] = None
 

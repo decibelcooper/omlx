@@ -584,6 +584,7 @@ class BatchedEngine(BaseEngine):
             stop=stop or [],
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
+            tools=kwargs.get("tools", None),
             seed=kwargs.get("seed", None),
         )
 
@@ -653,6 +654,7 @@ class BatchedEngine(BaseEngine):
             stop=stop or [],
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
+            tools=kwargs.get("tools", None),
             seed=kwargs.get("seed", None),
         )
 
