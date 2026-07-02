@@ -231,6 +231,175 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
     return cleaned, tool_calls
 
 
+# ---------------------------------------------------------------------------
+# Robust Qwen XML tool-call parser
+# ---------------------------------------------------------------------------
+
+_STRING_TYPES = {"string", "str", "text", "varchar", "char", "enum"}
+_BOOL_TYPES = {"boolean", "bool", "binary"}
+_OBJ_TYPES = {"object", "array", "arr"}
+
+
+def _get_argument_config(func_name: str, tools: Optional[List]) -> dict:
+    """Find the JSON-schema properties for a named tool."""
+    if tools is None:
+        return {}
+    for tool in tools:
+        function = tool.get("function", {}) if isinstance(tool, dict) else {}
+        if function.get("name") == func_name:
+            params = function.get("parameters", {})
+            if isinstance(params, dict):
+                return params.get("properties", {})
+    return {}
+
+
+def _coerce_param_value(param_value: str, param_name: str, param_config: dict) -> Any:
+    """Convert a raw parameter string to the schema-declared Python type."""
+    if param_value.lower() == "null":
+        return None
+
+    config = param_config.get(param_name, {})
+    param_type = str(config.get("type", "string")).strip().lower()
+
+    if param_type in _STRING_TYPES:
+        return param_value
+
+    if param_type.startswith(("int", "uint", "long", "short", "unsigned")):
+        return int(param_value)
+
+    if param_type.startswith(("num", "float")):
+        float_val = float(param_value)
+        int_val = int(float_val)
+        return float_val if (float_val - int_val) != 0 else int_val
+
+    if param_type in _BOOL_TYPES:
+        return param_value.lower() == "true"
+
+    if param_type in _OBJ_TYPES or param_type.startswith(("dict", "list")):
+        try:
+            return json.loads(param_value)
+        except (json.JSONDecodeError, ValueError):
+            try:
+                return ast.literal_eval(param_value)
+            except (ValueError, SyntaxError):
+                return param_value
+
+    try:
+        return ast.literal_eval(param_value)
+    except (ValueError, SyntaxError):
+        return param_value
+
+
+def _parse_qwen_xml_tool_calls_robust(
+    text: str,
+    tools: Optional[List] = None,
+) -> Tuple[str, Optional[List[ToolCall]]]:
+    """Parse Qwen-style XML tool calls with ``</parameter>``-aware boundaries.
+
+    The upstream/native Qwen parser uses a simple regex that stops at the
+    *first* ``</parameter>``.  That breaks whenever a parameter value (most
+    commonly a JSON-encoded ``edits`` array) legitimately contains that
+    substring.  This parser walks the parameter tags and only treats a
+    ``</parameter>`` as a real boundary when the following text is another
+    parameter tag, ``</function>``, ``</tool_call>``, or end-of-input.
+    """
+    tool_calls: List[ToolCall] = []
+    _PARAM_CLOSE = "</parameter>"
+    _FUNC_CLOSE = "</function>"
+
+    for block_match in re.finditer(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL):
+        content = block_match.group(1).strip()
+
+        # JSON object format: {"name": ..., "arguments": {...}}
+        if content.startswith("{"):
+            try:
+                parsed = json.loads(content, strict=False)
+                name = parsed.get("name", "")
+                arguments = parsed.get("arguments", {})
+                tool_calls.append(
+                    ToolCall(
+                        id=f"call_{uuid.uuid4().hex[:8]}",
+                        type="function",
+                        function=FunctionCall(
+                            name=name,
+                            arguments=_serialize_tool_call_arguments(arguments),
+                        ),
+                    )
+                )
+                continue
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+        func_match = re.search(r"<function=(\w+)>(.*)", content, re.DOTALL)
+        if not func_match:
+            continue
+
+        func_name = func_match.group(1)
+        rest = func_match.group(2)
+
+        # Find the </function> that actually closes this call, i.e. the one
+        # followed by </tool_call>, another <tool_call>, or end of text.
+        func_end: Optional[int] = None
+        for close_match in re.finditer(re.escape(_FUNC_CLOSE), rest):
+            after = rest[close_match.end() :].lstrip()
+            if not after or after.startswith(("</tool_call>", "<tool_call>")):
+                func_end = close_match.start()
+                break
+        if func_end is None:
+            # Fallback to the last occurrence if we cannot find a clean one.
+            positions = [m.start() for m in re.finditer(re.escape(_FUNC_CLOSE), rest)]
+            if not positions:
+                continue
+            func_end = positions[-1]
+
+        params_text = rest[:func_end]
+        param_config = _get_argument_config(func_name, tools)
+        arguments: Dict[str, Any] = {}
+
+        param_matches = list(re.finditer(r"<parameter=(\w+)>\s*", params_text, re.DOTALL))
+        for i, pm in enumerate(param_matches):
+            param_name = pm.group(1)
+            value_start = pm.end()
+            value_end = len(params_text)
+
+            for close_match in re.finditer(re.escape(_PARAM_CLOSE), params_text[value_start:], re.DOTALL):
+                pos = value_start + close_match.start()
+                after = params_text[pos + len(_PARAM_CLOSE) :].lstrip()
+                if (
+                    not after
+                    or after.startswith("<parameter=")
+                    or after.startswith(_FUNC_CLOSE)
+                    or after.startswith("</tool_call>")
+                ):
+                    value_end = pos
+                    break
+
+            value = params_text[value_start:value_end]
+            if value.startswith("\n"):
+                value = value[1:]
+            if value.endswith("\n"):
+                value = value[:-1]
+
+            arguments[param_name] = _coerce_param_value(value, param_name, param_config)
+
+        tool_calls.append(
+            ToolCall(
+                id=f"call_{uuid.uuid4().hex[:8]}",
+                type="function",
+                function=FunctionCall(
+                    name=func_name,
+                    arguments=_serialize_tool_call_arguments(arguments),
+                ),
+            )
+        )
+
+    if not tool_calls:
+        return text, None
+
+    cleaned = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL).strip()
+    return cleaned, tool_calls
+
+
 def _parse_namespaced_tool_calls(
     text: str, namespace: str
 ) -> Tuple[str, Optional[List[ToolCall]]]:
@@ -1118,6 +1287,18 @@ def _parse_tool_calls_impl(
         r"<think>.*?</think>", "", cleaned_text, flags=re.DOTALL
     ).strip()
 
+    # Robust Qwen XML parser first.  The native Qwen parser uses a naive
+    # regex that truncates parameter values at the first ``</parameter>``,
+    # which breaks JSON-encoded arrays/strings containing that literal
+    # substring (e.g. code edits).  Our parser resolves boundaries by
+    # looking at the following context.
+    if "<tool_call>" in cleaned_text:
+        cleaned_text_robust, tool_calls_robust = _parse_qwen_xml_tool_calls_robust(
+            cleaned_text, tools
+        )
+        if tool_calls_robust:
+            return cleaned_text_robust, tool_calls_robust
+
     # Try mlx-lm's native tool parser first
     if getattr(tokenizer, "has_tool_calling", False):
         tool_call_start = tokenizer.tool_call_start
@@ -1207,12 +1388,16 @@ def _parse_tool_calls_impl(
                     if gemma4_handled:
                         continue
 
-                    # Per-match XML fallback: regex-only, no ast.literal_eval,
-                    # recovers Qwen/GLM/Hermes-JSON formats. Prevents silent
-                    # drop when the native parser raises (e.g. ast.literal_eval
-                    # SyntaxError on non-Python-literal parameter values).
+                    # Per-match XML fallback: use the boundary-aware Qwen
+                    # parser first, then the generic XML fallback.  This
+                    # recovers cases where parameter values contain the
+                    # literal ``</parameter>`` substring.
                     fb_wrapped = f"<tool_call>{match}</tool_call>"
-                    _, fb_calls = _parse_xml_tool_calls(fb_wrapped)
+                    _, fb_calls = _parse_qwen_xml_tool_calls_robust(
+                        fb_wrapped, tools
+                    )
+                    if not fb_calls:
+                        _, fb_calls = _parse_xml_tool_calls(fb_wrapped)
                     if fb_calls:
                         tool_calls.extend(fb_calls)
                         logger.warning(
