@@ -7,12 +7,25 @@ Qwen3 / Qwen3.5 / Qwen3.6 tool-calling models.  It is the oMLX port of the
 constrained-decoding approach from ``qwen-perfect``.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 from typing import Any, List, Optional
 
 import mlx.core as mx
 import numpy as np
+
+# ---------------------------------------------------------------------------
+# Import llguidance at module load time so the hot-path (__call__ and
+# accept_token) never pays the import penalty on every generated token.
+# ---------------------------------------------------------------------------
+try:
+    import llguidance
+    import llguidance.mlx as _llg_mlx
+except Exception:
+    llguidance = None
+    _llg_mlx = None
 
 logger = logging.getLogger(__name__)
 

@@ -51,7 +51,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi import Request as FastAPIRequest
@@ -217,6 +217,56 @@ def _convert_parser_tool_calls(tool_calls: list[dict] | None) -> list[ToolCall]:
             )
         )
     return converted
+
+
+def _decode_json_string_values(value: Any) -> Any:
+    """Recursively decode string values that are JSON objects/arrays.
+
+    Some tool parsers (notably Qwen's XML parser when a generation is
+    truncated or contains nested JSON) return object/array parameters as
+    JSON-encoded strings instead of parsed structures.  This normalizes
+    those values so downstream consumers receive properly typed arguments.
+    """
+    if isinstance(value, dict):
+        return {k: _decode_json_string_values(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_decode_json_string_values(v) for v in value]
+    if isinstance(value, str):
+        stripped = value.strip()
+        if (stripped.startswith("{") and stripped.endswith("}")) or (
+            stripped.startswith("[") and stripped.endswith("]")
+        ):
+            try:
+                return json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                pass
+    return value
+
+
+def _tool_calls_with_decoded_arguments(
+    tool_calls: list[ToolCall] | None,
+) -> list[ToolCall] | None:
+    """Return tool calls with JSON-encoded string values decoded to objects/arrays.
+
+    Drops any tool call whose arguments are not valid JSON.
+    """
+    if not tool_calls:
+        return tool_calls
+    decoded: list[ToolCall] = []
+    for tc in tool_calls:
+        try:
+            args = json.loads(tc.function.arguments)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning(
+                "Dropping tool call %r with invalid JSON arguments: %r",
+                tc.function.name,
+                tc.function.arguments,
+            )
+            continue
+        args = _decode_json_string_values(args)
+        tc.function.arguments = json.dumps(args, ensure_ascii=False)
+        decoded.append(tc)
+    return decoded if decoded else None
 
 
 # =============================================================================
@@ -3507,6 +3557,27 @@ async def create_chat_completion(
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
                 cleaned_thinking = extraction.cleaned_thinking
+
+            # Decode any JSON-encoded object/array parameter values that the
+            # parser handed back as strings (common with Qwen XML tool calls
+            # for object/array parameters).
+            tool_calls = _tool_calls_with_decoded_arguments(tool_calls)
+
+            # If generation stopped due to length and the raw output does not
+            # end with a closed </tool_call> tag, the tool call is incomplete.
+            # Drop it so malformed calls do not pollute the conversation
+            # history and corrupt the next turn.
+            if (
+                tool_calls
+                and output.finish_reason == "length"
+                and raw_text
+                and not raw_text.rstrip().endswith("</tool_call>")
+            ):
+                logger.warning(
+                    "Dropping incomplete tool call(s) because generation "
+                    "hit max_tokens before </tool_call>."
+                )
+                tool_calls = None
 
             # Process response_format if specified
             if response_format and not tool_calls:
